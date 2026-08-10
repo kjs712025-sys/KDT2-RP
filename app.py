@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
 import os
 import sqlite3
@@ -12,8 +13,9 @@ from typing import Any, Iterable
 import numpy as np
 
 import cv2
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel
 
 try:
     from paho.mqtt import client as mqtt
@@ -100,6 +102,9 @@ except Exception:
 
 app = FastAPI(title="Smart Closet Backend")
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("smart_closet_backend")
+
 frame_lock = threading.Lock()
 latest_frame: Any = None
 last_snapshot_time = 0.0
@@ -133,6 +138,19 @@ def initialize_database() -> None:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_context (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at REAL,
+                    weather TEXT,
+                    aqi INTEGER,
+                    latitude REAL,
+                    longitude REAL,
+                    schedule TEXT
+                )
+                """
+            )
             connection.commit()
     except Exception:
         pass
@@ -161,6 +179,61 @@ def get_connection() -> sqlite3.Connection:
     connection = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     return connection
+
+
+class ContextPayload(BaseModel):
+    weather: str
+    aqi: int
+    latitude: float
+    longitude: float
+    schedule: Any
+
+
+def save_context_record(context_data: dict[str, Any]) -> None:
+    timestamp = time.time()
+    try:
+        with get_connection() as connection:
+            connection.execute(
+                "INSERT INTO app_context (created_at, weather, aqi, latitude, longitude, schedule) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    timestamp,
+                    str(context_data.get("weather", "")),
+                    parse_int(str(context_data.get("aqi", "0")), 0),
+                    float(context_data.get("latitude", 0.0)),
+                    float(context_data.get("longitude", 0.0)),
+                    json.dumps(context_data.get("schedule", []), ensure_ascii=False),
+                ),
+            )
+            connection.commit()
+    except Exception:
+        pass
+
+
+def fetch_latest_context() -> dict[str, Any] | None:
+    try:
+        with get_connection() as connection:
+            row = connection.execute(
+                "SELECT weather, aqi, latitude, longitude, schedule, created_at FROM app_context ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+
+        schedule_value = row["schedule"]
+        try:
+            schedule = json.loads(schedule_value) if schedule_value else []
+        except Exception:
+            schedule = schedule_value
+
+        return {
+            "weather": row["weather"],
+            "aqi": row["aqi"],
+            "latitude": row["latitude"],
+            "longitude": row["longitude"],
+            "schedule": schedule,
+            "created_at": row["created_at"],
+        }
+    except Exception:
+        return None
 
 
 def initialize_mqtt() -> None:
@@ -214,12 +287,21 @@ def get_gemini_client() -> Any | None:
         return None
 
     api_key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
-    if not api_key:
-        return None
+    google_creds = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
 
     try:
-        return genai.Client(api_key=api_key)
-    except Exception:
+        if api_key:
+            logger.info("Initializing Gemini client with API key")
+            return genai.Client(api_key=api_key)
+
+        if google_creds:
+            logger.info("Initializing Gemini client with GOOGLE_APPLICATION_CREDENTIALS=%s", google_creds)
+            return genai.Client()
+
+        logger.warning("No Gemini API key or Google credentials available")
+        return None
+    except Exception as exc:
+        logger.warning("Failed to initialize Gemini client: %s", exc)
         return None
 
 
@@ -235,31 +317,33 @@ def build_llm_recommendation(inventory: list[dict[str, Any]], weather_info: dict
         }
 
     prompt = (
-        "당신은 스마트 코디 도우미입니다. "
-        "아래의 옷장 데이터와 현재 날씨를 바탕으로 사용자가 입기 좋은 추천 옷 3개를 JSON으로만 응답하세요. "
-        "응답 형식은 {\"summary\": 문자열, \"recommendations\": [{\"id\": 숫자, \"reason\": 문자열}], \"weather_note\": 문자열} 입니다.\n"
-        f"날씨: {json.dumps(weather_info, ensure_ascii=False)}\n"
-        f"옷장: {json.dumps(inventory, ensure_ascii=False)}"
+        "당신은 스마트 옷장 스타일리스트입니다. 현재 날씨 정보와 옷장에 있는 항목들을 분석해 오늘 사용자에게 가장 잘 어울리는 상위 3개 항목을 선택하세요. "
+        "선택된 각 항목에 대해 왜 적합한지 짧은 문장으로 설명하세요. 불필요한 마크다운이나 추가 설명은 포함하지 마세요. "
+        "반환 값은 반드시 다음 JSON 형식으로만 작성하세요: {\"summary\": 문자열, \"recommendations\": [{\"id\": 숫자, \"reason\": 문자열}], \"weather_note\": 문자열}.\n"
+        f"Weather: {json.dumps(weather_info, ensure_ascii=False)}\n"
+        f"Inventory: {json.dumps(inventory, ensure_ascii=False)}"
     )
 
-    try:
-        client = get_gemini_client()
-        if client is None:
-            raise RuntimeError("Gemini client unavailable")
+    model_candidates = ["gemini-2.5-flash", "gemini-2.0-flash-001"]
+    for model_name in model_candidates:
+        try:
+            client = get_gemini_client()
+            if client is None:
+                raise RuntimeError("Gemini client unavailable")
 
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-        )
-        raw_text = getattr(response, "text", "") or ""
-        cleaned = raw_text.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.strip("`")
-        parsed = json.loads(cleaned)
-        if isinstance(parsed, dict):
-            return parsed
-    except Exception:
-        pass
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+            raw_text = getattr(response, "text", "") or ""
+            cleaned = raw_text.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.strip("`")
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            continue
 
     return {
         "summary": "오늘은 가볍고 편한 스타일을 추천해요.",
@@ -332,14 +416,51 @@ def save_frame_to_disk(frame: Any, image_path: Path) -> None:
         raise
 
 
+def get_image_color_name(image_path: Path) -> str:
+    try:
+        frame = cv2.imread(str(image_path))
+        if frame is None:
+            return "neutral"
+
+        average_bgr = frame.mean(axis=(0, 1))
+        blue, green, red = [float(c) for c in average_bgr]
+        if red >= green and red >= blue:
+            if red - max(green, blue) > 50:
+                return "red"
+            return "warm"
+        if green >= red and green >= blue:
+            if green - max(red, blue) > 50:
+                return "green"
+            return "olive"
+        if blue >= red and blue >= green:
+            if blue - max(red, green) > 50:
+                return "blue"
+            return "cool"
+        return "neutral"
+    except Exception:
+        return "neutral"
+
+
+def local_image_summary(image_path: Path) -> str:
+    core_color = get_image_color_name(image_path)
+    labels = analyze_image_labels(image_path)
+    label_text = ", ".join(labels[:2]) if labels else "옷"
+    if core_color in {"red", "blue", "green"}:
+        return f"{core_color} 톤의 {label_text}으로 보여요. 편안하게 입기 좋습니다."
+    if core_color in {"warm", "cool", "olive"}:
+        return f"은은한 {core_color} 컬러의 {label_text}으로 일상에 잘 어울립니다."
+    return f"기본적인 {label_text}으로 보이며, 스타일링하기 좋습니다."
+
+
 def analyze_image_with_gemini(image_path: Path) -> str:
     prompt = (
-        "Analyze this clothing item and provide a one-sentence summary of its type, "
-        "color, and fabric thickness suitable for a mobile app display."
+        "당신은 이미지 기반 패션 어시스턴트입니다. 이 옷 사진을 보고 한 문장으로 간결하게 설명하세요. "
+        "옷 종류, 대표 색상, 예상 소재감, 추천 착용 상황을 포함하고, 캐주얼/스포티/포멀 느낌이 명확하면 언급하세요. "
+        "응답은 반드시 한국어로 자연스럽게 작성하고, 여분의 해설이나 코드 블록 없이 한 문장으로만 작성하세요."
     )
 
     if genai is None or types is None:
-        return "Gemini analysis unavailable"
+        return local_image_summary(image_path)
 
     try:
         client = get_gemini_client()
@@ -347,18 +468,84 @@ def analyze_image_with_gemini(image_path: Path) -> str:
             raise RuntimeError("Gemini client unavailable")
 
         image_bytes = image_path.read_bytes()
-        image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[prompt, image_part],
-        )
-        text = getattr(response, "text", None)
-        if text:
-            return text.strip()
-    except Exception:
-        pass
+        image_mime_type = mimetypes.guess_type(str(image_path))[0] or "image/jpeg"
+        image_part = types.Part.from_bytes(data=image_bytes, mime_type=image_mime_type)
 
-    return "Gemini analysis unavailable"
+        model_candidates = ["gemini-2.5-flash", "gemini-2.0-flash-001", "gemini-2.5-flash-image"]
+        for model_name in model_candidates:
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[prompt, image_part],
+                )
+                text = getattr(response, "text", None)
+                if text:
+                    cleaned_text = text.strip()
+                    if cleaned_text.startswith("```") and cleaned_text.endswith("```"):
+                        cleaned_text = cleaned_text.strip("`")
+                    if len(cleaned_text) > 5:
+                        return cleaned_text
+            except Exception as exc:
+                logger.warning("Gemini image analysis failed for %s on %s: %s", image_path, model_name, exc)
+                continue
+    except Exception as exc:
+        logger.warning("Gemini image analysis failed for %s: %s", image_path, exc)
+
+    return local_image_summary(image_path)
+
+
+def analyze_image_labels(image_path: Path) -> list[str]:
+    if yolo_model is None:
+        return []
+
+    try:
+        frame = cv2.imread(str(image_path))
+        if frame is None:
+            return []
+
+        results = yolo_model.predict(frame, verbose=False)
+        if not results:
+            return []
+
+        labels: set[str] = set()
+        for box in results[0].boxes:
+            try:
+                class_id = int(box.cls[0])
+                class_name = resolve_class_name(yolo_model, class_id)
+                if class_name:
+                    labels.add(class_name)
+            except Exception:
+                continue
+
+        return sorted(labels)
+    except Exception:
+        return []
+
+
+def build_inventory_analysis(inventory: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    analysis = []
+    for item in inventory:
+        try:
+            image_path = Path(str(item.get("filepath", "")))
+            if not image_path.exists():
+                logger.warning("Inventory image path does not exist: %s", image_path)
+                continue
+
+            labels = analyze_image_labels(image_path)
+            summary = analyze_image_with_gemini(image_path)
+            analysis.append(
+                {
+                    "id": item.get("id"),
+                    "filepath": item.get("filepath"),
+                    "description": item.get("description", ""),
+                    "yolo_labels": labels,
+                    "summary": summary,
+                }
+            )
+        except Exception as exc:
+            logger.warning("Failed analysis for inventory item %s: %s", item.get("id"), exc)
+            continue
+    return analysis
 
 
 def upsert_image_record(image_id: int, file_path: str, description: str) -> None:
@@ -395,11 +582,11 @@ def handle_snapshot(frame: Any, qr_id: int) -> None:
     except Exception:
         return
 
-    description = "Gemini analysis unavailable"
+    description = "Gemini 분석 불가"
     try:
         description = analyze_image_with_gemini(image_path)
     except Exception:
-        description = "Gemini analysis unavailable"
+        description = "Gemini 분석 불가"
 
     try:
         upsert_image_record(qr_id, str(image_path), description)
@@ -568,6 +755,28 @@ def list_closet_items() -> JSONResponse:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@app.post("/api/context")
+def receive_context(context: ContextPayload) -> JSONResponse:
+    try:
+        save_context_record(context.dict())
+        return JSONResponse(content={"ok": True, "message": "Context saved"})
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/context")
+def get_context() -> JSONResponse:
+    try:
+        latest = fetch_latest_context()
+        if latest is None:
+            raise HTTPException(status_code=404, detail="No context saved yet")
+        return JSONResponse(content=latest)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/api/closet/{image_id}")
 def get_closet_item(image_id: int) -> JSONResponse:
     try:
@@ -582,15 +791,250 @@ def get_closet_item(image_id: int) -> JSONResponse:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.get("/api/recommend/llm")
-def recommend_with_llm() -> JSONResponse:
+def get_image_download_url(request: Request, image_id: int) -> str:
     try:
-        weather_info = get_weather_info()
-        inventory = fetch_closet_inventory()
-        recommendation = build_llm_recommendation(inventory, weather_info)
-        return JSONResponse(content={"weather": weather_info, **recommendation})
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        with get_connection() as connection:
+            row = connection.execute(
+                "SELECT filepath FROM images WHERE id = ?",
+                (image_id,),
+            ).fetchone()
+        if not row or not row["filepath"]:
+            return f"{request.url.scheme}://{request.url.hostname}:{request.url.port}/images/download/qr_{image_id}.jpg"
+        filename = Path(str(row["filepath"])).name
+        return f"{request.url.scheme}://{request.url.hostname}:{request.url.port}/images/download/{filename}"
+    except Exception:
+        return f"{request.url.scheme}://{request.url.hostname}:{request.url.port}/images/download/qr_{image_id}.jpg"
+
+
+def parse_exclude_ids(exclude_ids: str | None) -> set[int]:
+    if not exclude_ids:
+        return set()
+
+    results: set[int] = set()
+    for raw_value in exclude_ids.split(","):
+        try:
+            parsed = int(str(raw_value).strip())
+            results.add(parsed)
+        except Exception:
+            continue
+    return results
+
+
+def get_recommendation_ids(
+    inventory: list[dict[str, Any]],
+    weather_info: dict[str, Any],
+    context: dict[str, Any] | None = None,
+    exclude_ids: set[int] | None = None,
+) -> list[int]:
+    inventory_ids = [item["id"] for item in inventory]
+    if exclude_ids:
+        inventory_ids = [image_id for image_id in inventory_ids if image_id not in exclude_ids]
+
+    if not inventory_ids:
+        return []
+
+    if genai is None:
+        return choose_fallback_ids(inventory_ids, context)
+
+    context_description = ""
+    if context is not None:
+        context_description = (
+            f"Current app context:\n"
+            f"AQI: {context.get('aqi')}\n"
+            f"Location: {context.get('latitude')}, {context.get('longitude')}\n"
+            f"Schedule: {json.dumps(context.get('schedule', []), ensure_ascii=False)}\n"
+        )
+
+    prompt = (
+        f"Given the current outdoor weather of {weather_info['temperature_c']}°C "
+        f"({weather_info['conditions']}), look through this local closet inventory JSON data "
+        "and select exactly 3 item IDs that best layer or match with the user's outfit. "
+        "Return ONLY a raw JSON array of integers containing the selected IDs. Do not include markdown wraps or additional conversational text.\n\n"
+        f"{context_description}"
+        f"Inventory: {json.dumps(inventory, ensure_ascii=False)}"
+    )
+
+    try:
+        client = get_gemini_client()
+        if client is None:
+            raise RuntimeError("Gemini client unavailable")
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        raw_text = getattr(response, "text", "") or ""
+        cleaned = strip_json_wrappers(raw_text)
+        parsed = json.loads(cleaned)
+        if not isinstance(parsed, list):
+            raise ValueError("Gemini response is not a list")
+
+        selected_ids: list[int] = []
+        for value in parsed:
+            try:
+                parsed_value = int(value)
+                if parsed_value not in selected_ids:
+                    selected_ids.append(parsed_value)
+            except Exception:
+                continue
+
+        valid_ids = {item["id"] for item in inventory}
+        selected_ids = [value for value in selected_ids if value in valid_ids]
+
+        if len(selected_ids) >= 3:
+            return normalize_three_ids(selected_ids)
+    except Exception:
+        pass
+
+    return choose_fallback_ids(inventory_ids, context)
+
+
+@app.get("/api/recommend/context")
+def recommend_from_context(request: Request, exclude_ids: str | None = None) -> JSONResponse:
+    latest_context = fetch_latest_context()
+    if latest_context is None:
+        raise HTTPException(status_code=404, detail="No context saved yet")
+
+    inventory = fetch_closet_inventory()
+    if not inventory:
+        return JSONResponse(content={"recommendations": []})
+
+    weather_info = {
+        "temperature_c": 0,
+        "conditions": latest_context.get("weather", "Unknown"),
+    }
+    excluded = parse_exclude_ids(exclude_ids)
+    selected_ids = get_recommendation_ids(inventory, weather_info, latest_context, excluded)
+
+    recommendations = []
+    for image_id in selected_ids:
+        recommendations.append(
+            {
+                "id": image_id,
+                "download_url": get_image_download_url(request, image_id),
+            }
+        )
+
+    return JSONResponse(
+        content={
+            "context": latest_context,
+            "recommendations": recommendations,
+        }
+    )
+
+
+class ExcludeRecommendationPayload(BaseModel):
+    exclude_ids: list[int]
+
+
+@app.get("/api/recommend/different")
+def recommend_different(request: Request, exclude_ids: str | None = None) -> JSONResponse:
+    latest_context = fetch_latest_context()
+    inventory = fetch_closet_inventory()
+    if not inventory:
+        return JSONResponse(content={"recommendations": []})
+
+    weather_info = {
+        "temperature_c": 0,
+        "conditions": latest_context.get("weather", "Unknown") if latest_context else "Unknown",
+    }
+    excluded = parse_exclude_ids(exclude_ids)
+    selected_ids = get_recommendation_ids(inventory, weather_info, latest_context, excluded)
+
+    recommendations = []
+    for image_id in selected_ids:
+        recommendations.append(
+            {
+                "id": image_id,
+                "download_url": get_image_download_url(request, image_id),
+            }
+        )
+
+    return JSONResponse(content={"recommendations": recommendations})
+
+
+@app.post("/api/recommend/different")
+def recommend_different_post(request: Request, payload: ExcludeRecommendationPayload) -> JSONResponse:
+    latest_context = fetch_latest_context()
+    inventory = fetch_closet_inventory()
+    if not inventory:
+        return JSONResponse(content={"recommendations": []})
+
+    weather_info = {
+        "temperature_c": 0,
+        "conditions": latest_context.get("weather", "Unknown") if latest_context else "Unknown",
+    }
+    excluded = set(payload.exclude_ids or [])
+    selected_ids = get_recommendation_ids(inventory, weather_info, latest_context, excluded)
+
+    recommendations = []
+    for image_id in selected_ids:
+        recommendations.append(
+            {
+                "id": image_id,
+                "download_url": get_image_download_url(request, image_id),
+            }
+        )
+
+    return JSONResponse(content={"recommendations": recommendations})
+
+
+@app.get("/api/recommend/analyze")
+def recommend_with_analysis(request: Request, exclude_ids: str | None = None) -> JSONResponse:
+    inventory = fetch_closet_inventory()
+    if not inventory:
+        return JSONResponse(content={"recommendations": []})
+
+    excluded = parse_exclude_ids(exclude_ids)
+    filtered_inventory = [item for item in inventory if item.get("id") not in excluded]
+    if not filtered_inventory:
+        return JSONResponse(content={"recommendations": []})
+
+    analyses = build_inventory_analysis(filtered_inventory)
+
+    if not analyses:
+        selected_ids = []
+    else:
+        def score_analysis_item(item: dict[str, Any]) -> int:
+            score = len(item.get("yolo_labels", [])) * 2
+            summary = str(item.get("summary", ""))
+            score += min(5, max(0, len(summary.split())))
+            if "clothing" in summary.lower() or "톤" in summary.lower():
+                score += 1
+            return score
+
+        scores = [score_analysis_item(item) for item in analyses]
+        analyses.sort(key=score_analysis_item, reverse=True)
+
+        if len(analyses) > 3 and min(scores) == max(scores):
+            selected_ids = choose_fallback_ids([item["id"] for item in analyses], fetch_latest_context())
+        else:
+            selected_ids = [item["id"] for item in analyses[:3]]
+
+        if len(selected_ids) < 3:
+            fallback_ids = get_recommendation_ids(filtered_inventory, get_weather_info(), fetch_latest_context())
+            for image_id in fallback_ids:
+                if image_id not in selected_ids and len(selected_ids) < 3:
+                    selected_ids.append(image_id)
+
+    recommendations = []
+    for image_id in selected_ids:
+        analysis_item = next((item for item in analyses if item["id"] == image_id), None)
+        recommendations.append(
+            {
+                "id": image_id,
+                "download_url": get_image_download_url(request, image_id),
+                "yolo_labels": analysis_item["yolo_labels"] if analysis_item else [],
+                "summary": analysis_item["summary"] if analysis_item else "No analysis available",
+            }
+        )
+
+    return JSONResponse(
+        content={
+            "recommendations": recommendations,
+            "analysis_count": len(analyses),
+        }
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -905,54 +1349,6 @@ def strip_json_wrappers(raw_text: str) -> str:
     return text.strip()
 
 
-def get_recommendation_ids(inventory: list[dict[str, Any]], weather_info: dict[str, Any]) -> list[int]:
-    if genai is None:
-        return normalize_three_ids([item["id"] for item in inventory])
-
-    prompt = (
-        f"Given the current outdoor weather of {weather_info['temperature_c']}°C "
-        f"({weather_info['conditions']}), look through this local closet inventory JSON data "
-        "and select exactly 3 item IDs that best layer or match with the user's outfit. "
-        "Return ONLY a raw JSON array of integers containing the selected IDs. Do not include markdown wraps or additional conversational text.\n\n"
-        f"Inventory: {json.dumps(inventory, ensure_ascii=False)}"
-    )
-
-    try:
-        client = get_gemini_client()
-        if client is None:
-            raise RuntimeError("Gemini client unavailable")
-
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-        )
-        raw_text = getattr(response, "text", "") or ""
-        cleaned = strip_json_wrappers(raw_text)
-        parsed = json.loads(cleaned)
-        if not isinstance(parsed, list):
-            raise ValueError("Gemini response is not a list")
-
-        selected_ids: list[int] = []
-        for value in parsed:
-            try:
-                parsed_value = int(value)
-                if parsed_value not in selected_ids:
-                    selected_ids.append(parsed_value)
-            except Exception:
-                continue
-
-        valid_ids = {item["id"] for item in inventory}
-        selected_ids = [value for value in selected_ids if value in valid_ids]
-
-        if len(selected_ids) >= 3:
-            return normalize_three_ids(selected_ids)
-    except Exception:
-        pass
-
-    fallback_ids = [item["id"] for item in inventory]
-    return normalize_three_ids(fallback_ids)
-
-
 def normalize_three_ids(candidate_ids: list[int]) -> list[int]:
     unique_ids: list[int] = []
     for image_id in candidate_ids:
@@ -970,18 +1366,48 @@ def normalize_three_ids(candidate_ids: list[int]) -> list[int]:
     return unique_ids[:3]
 
 
+def choose_fallback_ids(inventory_ids: list[int], context: dict[str, Any] | None = None) -> list[int]:
+    if not inventory_ids:
+        return []
+
+    if len(inventory_ids) <= 3:
+        return inventory_ids.copy()
+
+    start = 0
+    if context is not None:
+        seed_text = (
+            f"{context.get('weather', '')}|{context.get('aqi', '')}|"
+            f"{context.get('latitude', '')}|{context.get('longitude', '')}|"
+            f"{json.dumps(context.get('schedule', []), ensure_ascii=False)}"
+        )
+        start = abs(hash(seed_text)) % len(inventory_ids)
+
+    step = max(1, len(inventory_ids) // 3)
+    selected: list[int] = []
+    idx = start
+
+    while len(selected) < 3:
+        candidate = inventory_ids[idx]
+        if candidate not in selected:
+            selected.append(candidate)
+        idx = (idx + step) % len(inventory_ids)
+
+    return selected
+
+
 @app.get("/api/recommend")
-def recommend() -> JSONResponse:
+def recommend(request: Request) -> JSONResponse:
     weather_info = get_weather_info()
+    latest_context = fetch_latest_context()
     inventory = fetch_closet_inventory()
-    selected_ids = get_recommendation_ids(inventory, weather_info)
+    selected_ids = get_recommendation_ids(inventory, weather_info, latest_context)
 
     response_payload = []
     for image_id in selected_ids:
         response_payload.append(
             {
                 "id": image_id,
-                "download_url": f"http://localhost:8000/images/download/qr_{image_id}.jpg",
+                "download_url": get_image_download_url(request, image_id),
             }
         )
 
