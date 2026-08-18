@@ -1,0 +1,23 @@
+[Unit]
+Description=Smart Closet Camera Streaming Backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kdt
+WorkingDirectory=/home/kdt/smart_closet_backend
+Environment="PATH=/home/kdt/smart_closet_backend/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+ExecStartPre=/bin/sleep 2
+ExecStart=/home/kdt/smart_closet_backend/.venv/bin/python3 -u app.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/kdt/smart-closet-logs/streaming.log
+StandardError=append:/home/kdt/smart-closet-logs/streaming.log
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

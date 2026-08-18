@@ -1,7 +1,12 @@
 .venv/
+.env
 __pycache__/
 .pytest_cache/
 *.pyc
 *.pyo
 *.pyd
 *.log
+
+# Downloaded model weights (re-fetched automatically, not source)
+yolov8n.pt
+models/

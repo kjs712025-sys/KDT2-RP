@@ -13,7 +13,7 @@ from typing import Any, Iterable
 import numpy as np
 
 import cv2
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
@@ -26,11 +26,6 @@ try:
     from ultralytics import YOLO
 except Exception:
     YOLO = None
-
-try:
-    from qreader import QReader
-except Exception:
-    QReader = None
 
 try:
     from google import genai
@@ -63,21 +58,10 @@ CAMERA_DEVICE = os.getenv("CAMERA_DEVICE", "/dev/video0").strip()
 CAMERA_INDEX = parse_int(os.getenv("CAMERA_INDEX", "0"), 0)
 MAX_CAMERA_INDEX = parse_int(os.getenv("MAX_CAMERA_INDEX", "5"), 5)
 
-STREAM_FRAME_WIDTH = parse_int(os.getenv("STREAM_WIDTH", "1280"), 1280)
-STREAM_FRAME_HEIGHT = parse_int(os.getenv("STREAM_HEIGHT", "720"), 720)
-STREAM_TARGET_FPS = parse_int(os.getenv("STREAM_FPS", "30"), 30)
-STREAM_JPEG_QUALITY = parse_int(os.getenv("STREAM_JPEG_QUALITY", "92"), 92)
-
+DIGIT_YOLO_MODEL_PATH = os.getenv("DIGIT_YOLO_MODEL", "").strip()
 
 def open_camera_source(source: int | str) -> cv2.VideoCapture:
     return cv2.VideoCapture(str(source))
-
-
-def configure_camera_stream(capture: cv2.VideoCapture) -> None:
-    capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    capture.set(cv2.CAP_PROP_FRAME_WIDTH, STREAM_FRAME_WIDTH)
-    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, STREAM_FRAME_HEIGHT)
-    capture.set(cv2.CAP_PROP_FPS, STREAM_TARGET_FPS)
 
 
 def find_available_camera_source() -> str | int:
@@ -125,15 +109,8 @@ logger = logging.getLogger("smart_closet_backend")
 frame_lock = threading.Lock()
 latest_frame: Any = None
 last_snapshot_time = 0.0
-last_uploaded_image_id: int | None = None
 camera_thread_started = False
 camera_lock = threading.Lock()
-detection_input_lock = threading.Lock()
-detection_input_frame: Any = None
-qr_result_lock = threading.Lock()
-latest_qr_codes: list[tuple[tuple[int, int, int, int], str]] = []
-clothing_result_lock = threading.Lock()
-latest_clothing_boxes: list[tuple[int, int, int, int]] = []
 brightness_lock = threading.Lock()
 stream_brightness = 0
 camera_unavailable_reported = False
@@ -141,28 +118,16 @@ mqtt_client: Any = None
 mqtt_client_lock = threading.Lock()
 
 try:
-    import torch
-    torch.set_num_threads(1)  # cap per-inference core fan-out so detection doesn't starve the camera/stream loop on this 4-core Pi
-except Exception:
-    pass
-
-try:
     yolo_model = YOLO("yolov8n.pt") if YOLO is not None else None
 except Exception:
     yolo_model = None
-
-
 try:
-    qr_reader = QReader() if QReader is not None else None
-except Exception:
-    qr_reader = None
+    digit_yolo_model = YOLO(DIGIT_YOLO_MODEL_PATH) if YOLO is not None and DIGIT_YOLO_MODEL_PATH else None
+except Exception as exc:
+    logger.warning("Failed to load digit YOLO model %s: %s", DIGIT_YOLO_MODEL_PATH, exc)
+    digit_yolo_model = None
 
-CLOTHING_MODEL_PATH = BASE_DIR / "models" / "deepfashion2_yolov8s-seg.pt"
 
-try:
-    clothing_model = YOLO(str(CLOTHING_MODEL_PATH)) if YOLO is not None and CLOTHING_MODEL_PATH.exists() else None
-except Exception:
-    clothing_model = None
 
 try:
     qr_detector = cv2.QRCodeDetector()
@@ -193,15 +158,6 @@ def initialize_database() -> None:
                     latitude REAL,
                     longitude REAL,
                     schedule TEXT
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS sent_recommendations (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    image_id INTEGER NOT NULL,
-                    sent_at REAL NOT NULL
                 )
                 """
             )
@@ -378,7 +334,7 @@ def build_llm_recommendation(inventory: list[dict[str, Any]], weather_info: dict
         f"Inventory: {json.dumps(inventory, ensure_ascii=False)}"
     )
 
-    model_candidates = ["gemini-3.6-flash", "gemini-flash-latest"]
+    model_candidates = ["gemini-2.5-flash", "gemini-2.0-flash-001"]
     for model_name in model_candidates:
         try:
             client = get_gemini_client()
@@ -421,6 +377,10 @@ def resolve_class_name(model: Any, class_id: int) -> str:
     return ""
 
 
+def is_clothing_like(class_name: str) -> bool:
+    return class_name in {"person", "clothing", "backpack", "tie", "suitcase"}
+
+
 def is_qr_anchor(class_name: str) -> bool:
     return class_name in {"qrcode", "backpack"}
 
@@ -449,37 +409,33 @@ def parse_valid_qr_id(raw_value: str) -> int | None:
     return None
 
 
-TOP_CLASS_IDS = {0, 1, 2, 3, 4, 5}  # short/long sleeved shirt & outwear, vest, sling -- excludes bottoms/dresses
-
-
-def detect_clothing_yolo(frame: Any) -> list[tuple[int, int, int, int]]:
-    """Detect worn tops (상의) in a BGR frame via a YOLOv8 DeepFashion2 detector.
-
-    Filters DeepFashion2's 13 garment classes down to the "top" categories
-    (shirts, outwear, vests) so bottoms and dresses aren't boxed as
-    clothing. Like detect_qr_codes, this is heavy (roughly 2s on this
-    device's CPU) and runs on the shared background thread (see
-    detection_loop) rather than inline with the camera loop.
-    """
-    results: list[tuple[int, int, int, int]] = []
-    if clothing_model is None or frame is None:
-        return results
-
+def detect_clothing_simple(frame: Any) -> list[tuple[int, int, int, int]]:
+    """Simple clothing detection using edge detection (no YOLO needed)"""
+    boxes = []
+    if frame is None:
+        return boxes
+    
     try:
-        predictions = clothing_model.predict(frame, verbose=False)
-        if not predictions:
-            return results
-
-        for box in predictions[0].boxes:
-            class_id = int(box.cls[0])
-            if class_id not in TOP_CLASS_IDS:
+        height, width = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < 1500:  # Skip small noise
                 continue
-            x1, y1, x2, y2 = box.xyxy[0]
-            results.append((int(x1), int(y1), int(x2), int(y2)))
+            
+            x, y, w, h = cv2.boundingRect(contour)
+            # Clothing-like dimensions
+            if w > 40 and h > 50 and 0.3 < w/max(h,1) < 3.0:
+                x1, y1, x2, y2 = x, y, x + w, y + h
+                if (x2 - x1) > 30 and (y2 - y1) > 40:
+                    boxes.append((x1, y1, x2, y2))
     except Exception:
         pass
-
-    return results
+    
+    return boxes
 
 
 def draw_clothing_overlay(frame: Any, boxes: list[tuple[int, int, int, int]]) -> Any:
@@ -572,10 +528,7 @@ def local_image_summary(image_path: Path) -> str:
     return f"기본적인 {label_text}으로 보이며, 스타일링하기 좋습니다."
 
 
-def analyze_image_with_gemini(image_path: Path) -> str | None:
-    """Describe a garment photo via Gemini. Returns None (never a placeholder
-    or heuristic guess) if Gemini is unavailable or every model attempt fails.
-    """
+def analyze_image_with_gemini(image_path: Path) -> str:
     prompt = (
         "당신은 이미지 기반 패션 어시스턴트입니다. 이 옷 사진을 보고 한 문장으로 간결하게 설명하세요. "
         "옷 종류, 대표 색상, 예상 소재감, 추천 착용 상황을 포함하고, 캐주얼/스포티/포멀 느낌이 명확하면 언급하세요. "
@@ -583,7 +536,7 @@ def analyze_image_with_gemini(image_path: Path) -> str | None:
     )
 
     if genai is None or types is None:
-        return None
+        return local_image_summary(image_path)
 
     try:
         client = get_gemini_client()
@@ -594,7 +547,7 @@ def analyze_image_with_gemini(image_path: Path) -> str | None:
         image_mime_type = mimetypes.guess_type(str(image_path))[0] or "image/jpeg"
         image_part = types.Part.from_bytes(data=image_bytes, mime_type=image_mime_type)
 
-        model_candidates = ["gemini-3.6-flash", "gemini-flash-latest"]
+        model_candidates = ["gemini-2.5-flash", "gemini-2.0-flash-001", "gemini-2.5-flash-image"]
         for model_name in model_candidates:
             try:
                 response = client.models.generate_content(
@@ -614,7 +567,7 @@ def analyze_image_with_gemini(image_path: Path) -> str | None:
     except Exception as exc:
         logger.warning("Gemini image analysis failed for %s: %s", image_path, exc)
 
-    return None
+    return local_image_summary(image_path)
 
 
 def analyze_image_labels(image_path: Path) -> list[str]:
@@ -655,12 +608,7 @@ def build_inventory_analysis(inventory: list[dict[str, Any]]) -> list[dict[str, 
                 continue
 
             labels = analyze_image_labels(image_path)
-            # Reuse the description already generated by Gemini at capture
-            # time (see handle_snapshot) instead of re-analyzing the image
-            # via a fresh Gemini call on every request -- with up to 10
-            # inventory items, doing that live was slow enough to time out
-            # client requests.
-            summary = item.get("description") or local_image_summary(image_path)
+            summary = analyze_image_with_gemini(image_path)
             analysis.append(
                 {
                     "id": item.get("id"),
@@ -710,7 +658,11 @@ def handle_snapshot(frame: Any, qr_id: int) -> None:
     except Exception:
         return
 
-    description = analyze_image_with_gemini(image_path) or ""
+    description = "Gemini 분석 불가"
+    try:
+        description = analyze_image_with_gemini(image_path)
+    except Exception:
+        description = "Gemini 분석 불가"
 
     try:
         upsert_image_record(qr_id, str(image_path), description)
@@ -718,74 +670,90 @@ def handle_snapshot(frame: Any, qr_id: int) -> None:
         pass
 
 
-def detect_qr_codes(frame: Any) -> list[tuple[tuple[int, int, int, int], str]]:
-    """Detect QR codes in a BGR frame via a YOLOv8-based detector (qrdet/qreader).
+def detect_numeric_id(frame: Any) -> int | None:
+    if digit_yolo_model is None:
+        return None
+    try:
+        results = digit_yolo_model.predict(frame, verbose=False)
+        boxes = results[0].boxes if results else []
+    except Exception:
+        return None
 
-    Unlike a full-frame symbol scan, this localizes each QR code with an
-    object detector before decoding it, so it keeps finding QR codes that
-    are small, angled, or embedded in a busy scene (e.g. on a garment tag
-    under the camera) rather than requiring a clean, frontal view of the
-    whole code. The tradeoff is much heavier per-frame compute than a
-    symbol scan (roughly 1-2s on this device's CPU), which is why
-    detection runs on the shared background thread (see detection_loop)
-    instead of inline with the camera capture loop.
-    """
-    results: list[tuple[tuple[int, int, int, int], str]] = []
-    if qr_reader is None or frame is None:
-        return results
+    candidates: list[tuple[float, int]] = []
+    for box in boxes:
+        try:
+            class_name = resolve_class_name(digit_yolo_model, int(box.cls[0]))
+            numeric_id = parse_valid_qr_id(class_name)
+            if numeric_id is not None:
+                candidates.append((float(box.conf[0]), numeric_id))
+        except Exception:
+            continue
+
+    return max(candidates, default=(0.0, None))[1]
+
+
+def detect_numeric_slot_id(frame: Any) -> int | None:
+    """Detect a 1-10 slot with YOLO, falling back to rendered digit matching."""
+    numeric_id = detect_numeric_id(frame)
+    if numeric_id is not None or frame is None:
+        return numeric_id
 
     try:
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        texts, detections = qr_reader.detect_and_decode(image=rgb_frame, return_detections=True)
-        for text, detection in zip(texts, detections):
-            x1, y1, x2, y2 = detection["bbox_xyxy"]
-            results.append(((int(x1), int(y1), int(x2), int(y2)), (text or "").strip()))
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+        points = cv2.findNonZero(binary)
+        if points is None:
+            return None
+        x, y, width, height = cv2.boundingRect(points)
+        observed = binary[y:y + height, x:x + width]
+        best_score, best_id = float("inf"), None
+        for candidate in range(1, 11):
+            template = np.full((400, 600), 255, dtype=np.uint8)
+            cv2.putText(template, str(candidate), (120, 260), cv2.FONT_HERSHEY_SIMPLEX, 5.0, 0, 12, cv2.LINE_AA)
+            _, template = cv2.threshold(template, 180, 255, cv2.THRESH_BINARY_INV)
+            template_points = cv2.findNonZero(template)
+            if template_points is None:
+                continue
+            tx, ty, tw, th = cv2.boundingRect(template_points)
+            resized = cv2.resize(template[ty:ty + th, tx:tx + tw], (width, height), interpolation=cv2.INTER_NEAREST)
+            score = float(np.mean(cv2.absdiff(observed, resized)))
+            if score < best_score:
+                best_score, best_id = score, candidate
+        return best_id
     except Exception:
-        pass
+        return None
 
-    return results
+def process_detected_frame(frame: Any) -> None:
+    global last_snapshot_time
 
-
-def draw_qr_overlay(frame: Any, qr_codes: list[tuple[tuple[int, int, int, int], str]]) -> Any:
-    """Draw red borders around detected QR codes (빨간색 테두리)"""
-    if frame is None or not qr_codes:
-        return frame
-
-    overlay = frame.copy()
-    for (x1, y1, x2, y2), text in qr_codes:
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 255), 3)
-        label = f"QR {text}" if text else "QR"
-        cv2.putText(overlay, label, (x1, max(15, y1 - 10)),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
-    return overlay
-
-
-def detect_qr_id(qr_codes: list[tuple[tuple[int, int, int, int], str]]) -> int | None:
-    for _box, text in qr_codes:
-        numeric_id = parse_valid_qr_id(text)
-        if numeric_id is not None:
-            return numeric_id
-    return None
-
-
-def process_detected_frame(
-    frame: Any,
-    clothing_boxes: list[tuple[int, int, int, int]] | None = None,
-    qr_codes: list[tuple[tuple[int, int, int, int], str]] | None = None,
-) -> None:
-    global last_snapshot_time, last_uploaded_image_id
-
-    if frame is None:
+    if yolo_model is None or frame is None:
         return
 
-    clothing_detected = bool(clothing_boxes if clothing_boxes is not None else detect_clothing_yolo(frame))
-    numeric_id = detect_qr_id(qr_codes if qr_codes is not None else detect_qr_codes(frame))
+    try:
+        results = yolo_model.predict(frame, verbose=False)
+    except Exception:
+        return
+
+    try:
+        detections = results[0].boxes if results else []
+    except Exception:
+        detections = []
+
+    clothing_detected = False
+
+    for box in detections:
+        try:
+            class_id = int(box.cls[0])
+            class_name = resolve_class_name(yolo_model, class_id)
+            xyxy = box.xyxy[0].tolist()
+        except Exception:
+            continue
+
+        if is_clothing_like(class_name):
+            clothing_detected = True
+
+    numeric_id = detect_numeric_id(frame)
     if not clothing_detected or numeric_id is None:
-        return
-    if numeric_id == last_uploaded_image_id:
-        # Same ID as the last successful upload -- skip until a different ID
-        # has been uploaded in between, so holding the same garment+QR in
-        # front of the camera doesn't keep re-triggering redundant uploads.
         return
     try:
         current_time = time.time()
@@ -795,14 +763,7 @@ def process_detected_frame(
         return
     try:
         last_snapshot_time = time.time()
-        last_uploaded_image_id = numeric_id
-        # handle_snapshot makes a network call to Gemini (can take several
-        # seconds) plus disk I/O; running it inline here would stall
-        # camera_loop's frame capture and freeze the live stream for that
-        # long. Fire it off on its own thread instead -- last_snapshot_time
-        # is already bumped above, so the cooldown check on the next
-        # iteration still holds even while this runs in the background.
-        threading.Thread(target=handle_snapshot, args=(frame.copy(), numeric_id), daemon=True).start()
+        handle_snapshot(frame.copy(), numeric_id)
     except Exception:
         pass
 
@@ -825,8 +786,6 @@ def camera_loop() -> None:
             if not capture.isOpened():
                 raise RuntimeError(f"Camera unavailable: {camera_source}")
 
-            configure_camera_stream(capture)
-
             while True:
                 try:
                     success, frame = capture.read()
@@ -834,28 +793,16 @@ def camera_loop() -> None:
                         raise RuntimeError("No frame read from camera")
 
                     frame = apply_stream_brightness(frame)
-                    # Clothing (blue) and QR codes (red) are both detected on
-                    # a single shared background thread (see detection_loop)
-                    # since YOLO inference for either is too slow to run
-                    # inline without stalling the stream.
-                    with detection_input_lock:
-                        global detection_input_frame
-                        detection_input_frame = frame.copy()
-
-                    with clothing_result_lock:
-                        clothing_boxes = latest_clothing_boxes
+                    # Detect clothing and add blue border overlay
+                    clothing_boxes = detect_clothing_simple(frame)
                     overlay_frame = draw_clothing_overlay(frame, clothing_boxes)
-
-                    with qr_result_lock:
-                        qr_codes = latest_qr_codes
-                    overlay_frame = draw_qr_overlay(overlay_frame, qr_codes)
 
                     with frame_lock:
                         global latest_frame
                         latest_frame = overlay_frame.copy()
 
                     try:
-                        process_detected_frame(frame, clothing_boxes, qr_codes)
+                        process_detected_frame(frame)
                     except Exception:
                         pass
 
@@ -880,40 +827,6 @@ def camera_loop() -> None:
                 pass
 
 
-def detection_loop() -> None:
-    """Run YOLO-based QR and top (상의) detection on the latest camera frame.
-
-    Both detectors run on this single background thread, one after the
-    other, rather than each on its own thread. Running them truly
-    concurrently was saturating all 4 cores on this Pi (two ~2s YOLO
-    inferences at once, each internally fanning out across cores) and
-    starving camera_loop of CPU, which is what made the live stream feel
-    slow. Sequencing them -- combined with capping each inference to a
-    single core (see torch.set_num_threads above) -- keeps at most one
-    heavy inference running at a time, leaving the rest of the CPU free
-    for frame capture/encode. Each detector's result is still roughly
-    3-4s stale in the worst case, which is fine for this use case (holding
-    a QR code + garment in front of the camera for a couple of seconds).
-    """
-    global latest_qr_codes, latest_clothing_boxes
-
-    while True:
-        with detection_input_lock:
-            frame = detection_input_frame
-
-        if frame is None:
-            time.sleep(0.1)
-            continue
-
-        codes = detect_qr_codes(frame)
-        with qr_result_lock:
-            latest_qr_codes = codes
-
-        boxes = detect_clothing_yolo(frame)
-        with clothing_result_lock:
-            latest_clothing_boxes = boxes
-
-
 def start_camera_thread_once() -> None:
     global camera_thread_started
 
@@ -922,31 +835,14 @@ def start_camera_thread_once() -> None:
             return
         camera_thread_started = True
 
-        threading.Thread(target=camera_loop, daemon=True).start()
-        threading.Thread(target=detection_loop, daemon=True).start()
+        thread = threading.Thread(target=camera_loop, daemon=True)
+        thread.start()
 
 
 @app.on_event("startup")
 def on_startup() -> None:
     initialize_mqtt()
     start_camera_thread_once()
-
-
-@app.get("/api/camera/brightness")
-def get_camera_brightness() -> JSONResponse:
-    with brightness_lock:
-        brightness = stream_brightness
-    return JSONResponse(content={"brightness": brightness, "min": -100, "max": 100})
-
-
-@app.post("/api/camera/brightness")
-def set_camera_brightness(value: int) -> JSONResponse:
-    if not -100 <= value <= 100:
-        raise HTTPException(status_code=400, detail="Brightness must be between -100 and 100")
-    global stream_brightness
-    with brightness_lock:
-        stream_brightness = value
-    return JSONResponse(content={"brightness": stream_brightness})
 
 
 @app.api_route("/api/send_id/{image_id}", methods=["GET", "POST"])
@@ -1028,57 +924,18 @@ def get_image_download_url(request: Request, image_id: int) -> str:
         return f"{request.url.scheme}://{request.url.hostname}:{request.url.port}/images/download/qr_{image_id}.jpg"
 
 
-def parse_exclude_ids(exclude_ids: str | list[str] | None) -> set[int]:
-    """Parse exclude_ids from either a single comma-separated string
-    (?exclude_ids=2,7,8) or a list of repeated query values
-    (?exclude_ids=2&exclude_ids=7&exclude_ids=8, e.g. from Retrofit).
-    """
+def parse_exclude_ids(exclude_ids: str | None) -> set[int]:
     if not exclude_ids:
         return set()
 
-    raw_values = exclude_ids if isinstance(exclude_ids, list) else [exclude_ids]
-
     results: set[int] = set()
-    for raw_value in raw_values:
-        for part in str(raw_value).split(","):
-            try:
-                results.add(int(part.strip()))
-            except Exception:
-                continue
+    for raw_value in exclude_ids.split(","):
+        try:
+            parsed = int(str(raw_value).strip())
+            results.add(parsed)
+        except Exception:
+            continue
     return results
-
-
-def fetch_sent_recommendation_ids() -> set[int]:
-    try:
-        with get_connection() as connection:
-            rows = connection.execute("SELECT DISTINCT image_id FROM sent_recommendations").fetchall()
-        return {row["image_id"] for row in rows}
-    except Exception:
-        return set()
-
-
-def clear_sent_recommendations() -> None:
-    try:
-        with get_connection() as connection:
-            connection.execute("DELETE FROM sent_recommendations")
-            connection.commit()
-    except Exception:
-        pass
-
-
-def record_sent_recommendations(image_ids: list[int]) -> None:
-    if not image_ids:
-        return
-    timestamp = time.time()
-    try:
-        with get_connection() as connection:
-            connection.executemany(
-                "INSERT INTO sent_recommendations (image_id, sent_at) VALUES (?, ?)",
-                [(image_id, timestamp) for image_id in image_ids],
-            )
-            connection.commit()
-    except Exception:
-        pass
 
 
 def get_recommendation_ids(
@@ -1087,9 +944,9 @@ def get_recommendation_ids(
     context: dict[str, Any] | None = None,
     exclude_ids: set[int] | None = None,
 ) -> list[int]:
-    if exclude_ids:
-        inventory = [item for item in inventory if item["id"] not in exclude_ids]
     inventory_ids = [item["id"] for item in inventory]
+    if exclude_ids:
+        inventory_ids = [image_id for image_id in inventory_ids if image_id not in exclude_ids]
 
     if not inventory_ids:
         return []
@@ -1107,16 +964,11 @@ def get_recommendation_ids(
         )
 
     prompt = (
-        "You are a smart closet stylist. Each inventory item has a `description` written by "
-        "an image model -- use those descriptions (garment type, color, material, formality) as "
-        "your primary basis for judging fit. Select exactly 3 item IDs, weighing two factors in "
-        "this priority order: (1) the user's calendar/schedule below, if any, is the primary "
-        "signal -- prefer items whose formality/style matches the day's events (e.g. formal wear "
-        "for a meeting, athletic wear for exercise); (2) once schedule fit is satisfied, use the "
-        "current weather as a secondary filter (e.g. avoid short sleeves in cold weather). "
-        f"Current outdoor weather: {weather_info['temperature_c']}°C, {weather_info['conditions']}.\n"
-        f"{context_description}"
+        f"Given the current outdoor weather of {weather_info['temperature_c']}°C "
+        f"({weather_info['conditions']}), look through this local closet inventory JSON data "
+        "and select exactly 3 item IDs that best layer or match with the user's outfit. "
         "Return ONLY a raw JSON array of integers containing the selected IDs. Do not include markdown wraps or additional conversational text.\n\n"
+        f"{context_description}"
         f"Inventory: {json.dumps(inventory, ensure_ascii=False)}"
     )
 
@@ -1125,35 +977,30 @@ def get_recommendation_ids(
         if client is None:
             raise RuntimeError("Gemini client unavailable")
 
-        for model_name in ("gemini-3.6-flash", "gemini-flash-latest"):
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        raw_text = getattr(response, "text", "") or ""
+        cleaned = strip_json_wrappers(raw_text)
+        parsed = json.loads(cleaned)
+        if not isinstance(parsed, list):
+            raise ValueError("Gemini response is not a list")
+
+        selected_ids: list[int] = []
+        for value in parsed:
             try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                )
-                raw_text = getattr(response, "text", "") or ""
-                cleaned = strip_json_wrappers(raw_text)
-                parsed = json.loads(cleaned)
-                if not isinstance(parsed, list):
-                    raise ValueError("Gemini response is not a list")
-
-                selected_ids: list[int] = []
-                for value in parsed:
-                    try:
-                        parsed_value = int(value)
-                        if parsed_value not in selected_ids:
-                            selected_ids.append(parsed_value)
-                    except Exception:
-                        continue
-
-                valid_ids = {item["id"] for item in inventory}
-                selected_ids = [value for value in selected_ids if value in valid_ids]
-
-                if len(selected_ids) >= 3:
-                    return normalize_three_ids(selected_ids)
-            except Exception as exc:
-                logger.warning("Gemini recommendation failed on %s: %s", model_name, exc)
+                parsed_value = int(value)
+                if parsed_value not in selected_ids:
+                    selected_ids.append(parsed_value)
+            except Exception:
                 continue
+
+        valid_ids = {item["id"] for item in inventory}
+        selected_ids = [value for value in selected_ids if value in valid_ids]
+
+        if len(selected_ids) >= 3:
+            return normalize_three_ids(selected_ids)
     except Exception:
         pass
 
@@ -1161,7 +1008,7 @@ def get_recommendation_ids(
 
 
 @app.get("/api/recommend/context")
-def recommend_from_context(request: Request, exclude_ids: list[str] = Query(default=[])) -> JSONResponse:
+def recommend_from_context(request: Request, exclude_ids: str | None = None) -> JSONResponse:
     latest_context = fetch_latest_context()
     if latest_context is None:
         raise HTTPException(status_code=404, detail="No context saved yet")
@@ -1199,7 +1046,7 @@ class ExcludeRecommendationPayload(BaseModel):
 
 
 @app.get("/api/recommend/different")
-def recommend_different(request: Request, exclude_ids: list[str] = Query(default=[])) -> JSONResponse:
+def recommend_different(request: Request, exclude_ids: str | None = None) -> JSONResponse:
     latest_context = fetch_latest_context()
     inventory = fetch_closet_inventory()
     if not inventory:
@@ -1251,7 +1098,7 @@ def recommend_different_post(request: Request, payload: ExcludeRecommendationPay
 
 
 @app.get("/api/recommend/analyze")
-def recommend_with_analysis(request: Request, exclude_ids: list[str] = Query(default=[])) -> JSONResponse:
+def recommend_with_analysis(request: Request, exclude_ids: str | None = None) -> JSONResponse:
     inventory = fetch_closet_inventory()
     if not inventory:
         return JSONResponse(content={"recommendations": []})
@@ -1494,8 +1341,7 @@ def home() -> HTMLResponse:
                     <p>확인할 주소:</p>
                     <div class="links">
                         <a href="/docs">API Docs</a>
-                        <a class="secondary" href="/video_feed/view">MJPEG Stream (조도 조절)</a>
-                        <a href="/video_feed">MJPEG Raw</a>
+                        <a class="secondary" href="/video_feed">MJPEG Stream</a>
                     </div>
                     <div class="section">
                         <h2>DB 상태</h2>
@@ -1539,9 +1385,7 @@ def video_feed() -> StreamingResponse:
                     frame = create_placeholder_frame("Camera unavailable")
 
                 try:
-                    success, buffer = cv2.imencode(
-                        ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), STREAM_JPEG_QUALITY]
-                    )
+                    success, buffer = cv2.imencode(".jpg", frame)
                     if not success:
                         time.sleep(STREAM_FRAME_DELAY_SECONDS)
                         continue
@@ -1562,187 +1406,6 @@ def video_feed() -> StreamingResponse:
         generate_frames(),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
-
-
-@app.get("/video_feed/view")
-def video_feed_view() -> HTMLResponse:
-    html = """
-    <!doctype html>
-    <html lang="ko">
-        <head>
-            <meta charset="utf-8" />
-            <meta name="viewport" content="width=device-width, initial-scale=1" />
-            <title>Camera Stream</title>
-            <style>
-                body {
-                    font-family: Arial, sans-serif;
-                    margin: 0;
-                    min-height: 100vh;
-                    display: grid;
-                    place-items: center;
-                    background: linear-gradient(135deg, #f7f7f7, #e8eef7);
-                    color: #1f2937;
-                }
-                .card {
-                    background: white;
-                    padding: 24px;
-                    border-radius: 16px;
-                    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
-                    max-width: 720px;
-                    width: calc(100% - 32px);
-                }
-                h1 { margin-top: 0; font-size: 20px; }
-                .hint {
-                    color: #6b7280;
-                    font-size: 13px;
-                    margin: 4px 0 16px;
-                }
-                .stream-wrap {
-                    position: relative;
-                    border-radius: 12px;
-                    overflow: hidden;
-                    background: #000;
-                    cursor: ns-resize;
-                    user-select: none;
-                }
-                .stream-wrap img {
-                    display: block;
-                    width: 100%;
-                    height: auto;
-                }
-                .badge {
-                    position: absolute;
-                    top: 10px;
-                    right: 10px;
-                    padding: 6px 12px;
-                    border-radius: 999px;
-                    background: rgba(17, 24, 39, 0.7);
-                    color: white;
-                    font-size: 13px;
-                    font-variant-numeric: tabular-nums;
-                    pointer-events: none;
-                }
-                .controls {
-                    display: flex;
-                    align-items: center;
-                    gap: 12px;
-                    margin-top: 14px;
-                }
-                .controls input[type=range] { flex: 1; }
-                .controls button {
-                    padding: 8px 14px;
-                    border-radius: 10px;
-                    border: 1px solid #d1d5db;
-                    background: #f9fafb;
-                    cursor: pointer;
-                    font-size: 13px;
-                }
-                .controls button:hover { background: #f3f4f6; }
-            </style>
-        </head>
-        <body>
-            <main class="card">
-                <h1>카메라 스트림</h1>
-                <p class="hint">영상 위에서 마우스를 드래그하면(위로: 밝게 / 아래로: 어둡게) 조도가 조절됩니다. 휠로도 미세 조정할 수 있습니다.</p>
-                <div class="stream-wrap" id="streamWrap">
-                    <img id="stream" src="/video_feed" alt="camera stream" draggable="false" />
-                    <div class="badge" id="badge">밝기: 0</div>
-                </div>
-                <div class="controls">
-                    <input type="range" id="slider" min="-100" max="100" step="1" value="0" />
-                    <button type="button" id="resetBtn">초기화</button>
-                </div>
-            </main>
-            <script>
-                const wrap = document.getElementById('streamWrap');
-                const badge = document.getElementById('badge');
-                const slider = document.getElementById('slider');
-                const resetBtn = document.getElementById('resetBtn');
-
-                let current = 0;
-                let dragging = false;
-                let dragStartY = 0;
-                let dragStartValue = 0;
-                let lastSentAt = 0;
-                const SENSITIVITY = 0.6;
-                const SEND_INTERVAL_MS = 80;
-
-                function clamp(v) {
-                    return Math.max(-100, Math.min(100, Math.round(v)));
-                }
-
-                function updateUI(value) {
-                    current = value;
-                    badge.textContent = `밝기: ${value}`;
-                    slider.value = value;
-                }
-
-                function sendBrightness(value, force) {
-                    const now = Date.now();
-                    if (!force && now - lastSentAt < SEND_INTERVAL_MS) return;
-                    lastSentAt = now;
-                    fetch(`/api/camera/brightness?value=${value}`, { method: 'POST' }).catch(() => {});
-                }
-
-                async function loadInitial() {
-                    try {
-                        const res = await fetch('/api/camera/brightness');
-                        const data = await res.json();
-                        updateUI(clamp(data.brightness || 0));
-                    } catch (error) {
-                        updateUI(0);
-                    }
-                }
-
-                wrap.addEventListener('mousedown', (event) => {
-                    dragging = true;
-                    dragStartY = event.clientY;
-                    dragStartValue = current;
-                    event.preventDefault();
-                });
-
-                window.addEventListener('mousemove', (event) => {
-                    if (!dragging) return;
-                    const delta = (dragStartY - event.clientY) * SENSITIVITY;
-                    const value = clamp(dragStartValue + delta);
-                    if (value !== current) {
-                        updateUI(value);
-                        sendBrightness(value, false);
-                    }
-                });
-
-                window.addEventListener('mouseup', () => {
-                    if (!dragging) return;
-                    dragging = false;
-                    sendBrightness(current, true);
-                });
-
-                wrap.addEventListener('wheel', (event) => {
-                    event.preventDefault();
-                    const step = event.deltaY > 0 ? -5 : 5;
-                    const value = clamp(current + step);
-                    updateUI(value);
-                    sendBrightness(value, true);
-                }, { passive: false });
-
-                slider.addEventListener('input', () => {
-                    const value = clamp(Number(slider.value));
-                    updateUI(value);
-                    sendBrightness(value, false);
-                });
-                slider.addEventListener('change', () => sendBrightness(current, true));
-
-                resetBtn.addEventListener('click', () => {
-                    updateUI(0);
-                    sendBrightness(0, true);
-                });
-
-                loadInitial();
-            </script>
-        </body>
-    </html>
-    """
-    return HTMLResponse(content=html)
 
 
 @app.get("/images/download/{filename}")
@@ -1777,7 +1440,7 @@ def upload_image(image_id: int, file: UploadFile = File(...)) -> JSONResponse:
         with open(image_path, "wb") as out_file:
             out_file.write(file_bytes)
 
-        description = analyze_image_with_gemini(image_path) or ""
+        description = f"Uploaded image for id {image_id}"
         upsert_image_record(image_id, str(image_path), description)
         return JSONResponse(content={"id": image_id, "filepath": str(image_path), "description": description})
     except Exception:
@@ -1856,32 +1519,18 @@ def recommend(request: Request) -> JSONResponse:
     weather_info = get_weather_info()
     latest_context = fetch_latest_context()
     inventory = fetch_closet_inventory()
-
-    inventory_ids = {item["id"] for item in inventory}
-    already_sent = fetch_sent_recommendation_ids()
-    reset_cycle = bool(inventory_ids) and inventory_ids.issubset(already_sent)
-    if reset_cycle:
-        clear_sent_recommendations()
-        already_sent = set()
-
-    selected_ids = get_recommendation_ids(inventory, weather_info, latest_context, already_sent)
+    selected_ids = get_recommendation_ids(inventory, weather_info, latest_context)
 
     response_payload = []
     for image_id in selected_ids:
-        published = publish_slot_id(image_id)
         response_payload.append(
             {
                 "id": image_id,
                 "download_url": get_image_download_url(request, image_id),
-                "published": published,
             }
         )
-    record_sent_recommendations(selected_ids)
 
-    return JSONResponse(
-        content=response_payload,
-        headers={"X-Cycle-Reset": "true" if reset_cycle else "false"},
-    )
+    return JSONResponse(content=response_payload)
 
 
 if __name__ == "__main__":
